@@ -83,6 +83,10 @@ public final class UserbackSDK: NSObject {
     private var pendingScreenshotDataURL: String?
     private var isCapturingScreenshot = false
     private var shouldSendScreenshotWhenReady = false
+    private var pendingVideoFileURL: URL?
+    private var isSendingNativeVideo = false
+    private var patchedWidgetSource: String?
+    private var didPatchWidgetJavaScript = false
     private var latestWidgetConfig: [String: Any]?
     private var latestWidgetSize: CGSize?
     private var webViewLayoutConstraints: [NSLayoutConstraint] = []
@@ -169,6 +173,7 @@ public final class UserbackSDK: NSObject {
     public func start(with configuration: Configuration) {
         self.configuration = configuration
         startNativeObserversIfNeeded()
+        prefetchPatchedWidgetJavaScript()
 
         if webView != nil {
             reloadWidget()
@@ -203,6 +208,8 @@ public final class UserbackSDK: NSObject {
         webView = nil
         pendingWindowAttachment = false
         hasLoadedWidgetPage = false
+        didPatchWidgetJavaScript = false
+        pendingVideoFileURL = nil
         latestWidgetConfig = nil
         latestWidgetSize = nil
         stopNativeObserversIfNeeded()
@@ -243,7 +250,13 @@ public final class UserbackSDK: NSObject {
     }
 
     public func startNativeRecording() {
-        log("Native recording hook called. Plug in your native recorder integration here.")
+        log("Native recording is started by the host app, then attached via attachNativeVideo.")
+    }
+
+    /// Queues an MP4 to inject as `Feedback.video_blob` once the widget form is on screen.
+    /// Call before `openForm`. Screenshot capture is skipped when a video is pending.
+    public func attachNativeVideo(fileURL: URL) {
+        pendingVideoFileURL = fileURL
     }
 
     private func startNativeObserversIfNeeded() {
@@ -417,6 +430,13 @@ public final class UserbackSDK: NSObject {
 
     public func openForm(mode: String = "", directTo: String? = nil, projectKey: String = "") {
         guard currentSurveyInfo == nil else { return }
+
+        // A pending native video replaces the screenshot step. `submitVideoCapture`
+        // clears screenshot data anyway, so capturing first would be wasted work.
+        if pendingVideoFileURL != nil {
+            performOpenForm(mode: mode, directTo: nil, projectKey: projectKey)
+            return
+        }
 
         // Capture first, then tell JS to open. Running them together means the first
         // `drawHierarchy` (slow, and it waits for screen updates) lands on the same
@@ -667,27 +687,7 @@ public final class UserbackSDK: NSObject {
         let configuredURLString = configuration?.widgetJSURL ?? defaultWidgetJSURL
         if !hasLoadedWidgetPage {
             if shouldLoadAsWidgetScript(configuredURLString) {
-                let html = """
-                <html>
-                    <head>
-                        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover\">
-                        <style>
-                            html, body {
-                                margin: 0;
-                                padding: 0;
-                                width: 100%;
-                                height: 100%;
-                                background: transparent;
-                            }
-                        </style>
-                    </head>
-                    <body>
-                        <script src=\"\(configuredURLString)\"></script>
-                    </body>
-                </html>
-                """
-                let baseURL = URL(string: configuredURLString).flatMap { URL(string: "\($0.scheme ?? "https")://\($0.host ?? "")") }
-                webView.loadHTMLString(html, baseURL: baseURL)
+                loadWidgetPage(in: webView, scriptURLString: configuredURLString)
             } else if let url = URL(string: configuredURLString) {
                 webView.load(URLRequest(url: url))
             }
@@ -877,10 +877,88 @@ public final class UserbackSDK: NSObject {
         )
         webView.configuration.userContentController.addUserScript(script)
 
+        hasLoadedWidgetPage = false
+        didPatchWidgetJavaScript = false
+
         if !attachToWindow(webView) {
             scheduleWindowAttachRetry()
         }
         state = .loading
+    }
+
+    private func widgetPageHTML(scriptURLString: String, inlinedJavaScript: String?) -> String {
+        let scriptTag: String
+        if let inlinedJavaScript {
+            let safe = inlinedJavaScript.replacingOccurrences(of: "</script>", with: "<\\/script>")
+            scriptTag = "<script>\(safe)</script>"
+        } else {
+            scriptTag = "<script src=\"\(scriptURLString)\"></script>"
+        }
+
+        return """
+        <html>
+            <head>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+                <style>
+                    html, body {
+                        margin: 0;
+                        padding: 0;
+                        width: 100%;
+                        height: 100%;
+                        background: transparent;
+                    }
+                </style>
+            </head>
+            <body>
+                \(scriptTag)
+            </body>
+        </html>
+        """
+    }
+
+    private func loadWidgetPage(in webView: WKWebView, scriptURLString: String) {
+        let inlined = patchedWidgetSource
+        didPatchWidgetJavaScript = inlined != nil
+        let html = widgetPageHTML(scriptURLString: scriptURLString, inlinedJavaScript: inlined)
+        let baseURL = URL(string: scriptURLString).flatMap { URL(string: "\($0.scheme ?? "https")://\($0.host ?? "")") }
+        webView.loadHTMLString(html, baseURL: baseURL)
+        if didPatchWidgetJavaScript {
+            log("Loaded widget JS with native video listener.")
+        }
+    }
+
+    private func prefetchPatchedWidgetJavaScript() {
+        guard patchedWidgetSource == nil else { return }
+        let urlString = configuration?.widgetJSURL ?? defaultWidgetJSURL
+        guard let url = URL(string: urlString) else { return }
+
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+            guard let self else { return }
+            if let error {
+                Task { @MainActor in
+                    self.log("Failed to prefetch widget JS: \(error.localizedDescription)")
+                }
+                return
+            }
+            guard let data,
+                  let source = String(data: data, encoding: .utf8),
+                  let patched = WidgetJavaScript.withNativeVideoListener(source) else {
+                Task { @MainActor in
+                    self.log("Widget JS did not contain the nativeScreenshot hook — video inject disabled.")
+                }
+                return
+            }
+
+            Task { @MainActor in
+                self.patchedWidgetSource = patched
+                self.applyPatchedWidgetIfNeeded()
+            }
+        }.resume()
+    }
+
+    private func applyPatchedWidgetIfNeeded() {
+        guard patchedWidgetSource != nil, !didPatchWidgetJavaScript, webView != nil else { return }
+        reloadWidget()
     }
 
     private func shouldLoadAsWidgetScript(_ urlString: String?) -> Bool {
@@ -1381,7 +1459,11 @@ extension UserbackSDK: WKScriptMessageHandler {
             webView?.alpha = 1
             webView?.isUserInteractionEnabled = true
 
-            if let dataURL = pendingScreenshotDataURL {
+            if let videoURL = pendingVideoFileURL {
+                pendingVideoFileURL = nil
+                pendingScreenshotDataURL = nil
+                sendNativeVideoToJavaScript(fileURL: videoURL)
+            } else if let dataURL = pendingScreenshotDataURL {
                 pendingScreenshotDataURL = nil
                 sendScreenshotToJavaScript(dataURL)
             } else if isCapturingScreenshot {
@@ -1679,6 +1761,66 @@ extension UserbackSDK: WKScriptMessageHandler {
             customEventName: "userback:nativeScreenshot",
             successLogPrefix: "Screenshot"
         )
+    }
+
+    /// Chunks the MP4 into the widget page, then dispatches `userback:nativeVideo`.
+    private func sendNativeVideoToJavaScript(fileURL: URL) {
+        guard !isSendingNativeVideo else { return }
+
+        guard let data = try? Data(contentsOf: fileURL), !data.isEmpty else {
+            log("Failed to read native video at \(fileURL.path)")
+            return
+        }
+
+        isSendingNativeVideo = true
+        let chunkSize = 384 * 1024
+        var chunks: [String] = []
+        chunks.reserveCapacity((data.count + chunkSize - 1) / chunkSize)
+
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + chunkSize, data.count)
+            chunks.append(data[offset..<end].base64EncodedString())
+            offset = end
+        }
+
+        log("Sending native video (\(data.count) bytes, \(chunks.count) chunks)")
+        if !didPatchWidgetJavaScript {
+            log("Widget JS was not patched with nativeVideo — attach may no-op.")
+        }
+        evaluateJavaScript(WidgetJavaScript.resetChunkBufferScript()) { [weak self] _, error in
+            guard let self else { return }
+            if let error {
+                self.isSendingNativeVideo = false
+                self.log("Native video buffer reset failed: \(error.localizedDescription)")
+                return
+            }
+            self.appendNativeVideoChunks(chunks, index: 0)
+        }
+    }
+
+    private func appendNativeVideoChunks(_ chunks: [String], index: Int) {
+        if index >= chunks.count {
+            evaluateJavaScript(WidgetJavaScript.assembleAndDispatchScript()) { [weak self] result, error in
+                self?.isSendingNativeVideo = false
+                if let error {
+                    self?.log("Native video assemble failed: \(error.localizedDescription)")
+                    return
+                }
+                self?.log("Native video delivered to JS: \(result as? String ?? "unconfirmed")")
+            }
+            return
+        }
+
+        evaluateJavaScript(WidgetJavaScript.appendChunkScript(chunks[index])) { [weak self] _, error in
+            guard let self else { return }
+            if let error {
+                self.isSendingNativeVideo = false
+                self.log("Native video chunk \(index) failed: \(error.localizedDescription)")
+                return
+            }
+            self.appendNativeVideoChunks(chunks, index: index + 1)
+        }
     }
 
     private func sendMessageToJavaScript(
