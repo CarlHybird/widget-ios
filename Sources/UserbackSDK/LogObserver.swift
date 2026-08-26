@@ -109,6 +109,23 @@ public final class LogObserver {
         }
     }
 
+    /// Apple system logs that are not app-level diagnostics.
+    private static let noiseNeedles = [
+        "RemoteTextInput",
+        "RTILog",
+        "NSAutoresizingMaskLayoutConstraint",
+        "NSLayoutConstraint",
+        "Unable to simultaneously satisfy constraints",
+        "UIViewAlertForUnsatisfiableConstraints",
+        "Probably at least one of the constraints",
+        "Will attempt to recover by breaking constraint",
+        "UIConstraintBasedLayoutDebugging category on UIView",
+        "_UIToolbarContentView",
+        "_UIButtonBarStackView",
+    ]
+
+    private static let whitespaceRunRegex = try? NSRegularExpression(pattern: #"\s+"#)
+
     private func prepare(_ message: String) -> String? {
         // Avoid feedback loops from SDK/internal observer logs.
         if message.hasPrefix("UserbackSDK:") ||
@@ -117,30 +134,33 @@ public final class LogObserver {
             return nil
         }
 
-        // Ignore noisy Apple system logs that are not app-level diagnostics.
-        if message.hasPrefix("OSLOG-") ||
-            message.localizedCaseInsensitiveContains("RemoteTextInput") ||
-            message.localizedCaseInsensitiveContains("RTILog") ||
-            message.localizedCaseInsensitiveContains("NSAutoresizingMaskLayoutConstraint") ||
-            message.localizedCaseInsensitiveContains("NSLayoutConstraint") ||
-            message.localizedCaseInsensitiveContains("Unable to simultaneously satisfy constraints") ||
-            message.localizedCaseInsensitiveContains("UIViewAlertForUnsatisfiableConstraints") ||
-            message.localizedCaseInsensitiveContains("Probably at least one of the constraints") ||
-            message.localizedCaseInsensitiveContains("Will attempt to recover by breaking constraint") ||
-            message.localizedCaseInsensitiveContains("UIConstraintBasedLayoutDebugging category on UIView") ||
-            message.localizedCaseInsensitiveContains("_UIToolbarContentView") ||
-            message.localizedCaseInsensitiveContains("_UIButtonBarStackView") {
+        if message.hasPrefix("OSLOG-") {
             return nil
         }
 
-        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        // `.literal` skips the locale-aware normalisation that made this the most
+        // expensive step in the reader; these needles are all plain ASCII.
+        let isNoise = Self.noiseNeedles.contains { needle in
+            message.range(of: needle, options: [.caseInsensitive, .literal]) != nil
+        }
+        if isNoise { return nil }
+
+        var trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("  ") || trimmed.contains("\t") {
+            trimmed = Self.collapseWhitespace(trimmed)
+        }
 
         guard !trimmed.isEmpty else { return nil }
 
         let redacted = SecretRedactor.redact(trimmed)
         guard !redacted.isEmpty else { return nil }
         return redacted
+    }
+
+    private static func collapseWhitespace(_ input: String) -> String {
+        guard let regex = whitespaceRunRegex else { return input }
+        let range = NSRange(input.startIndex..., in: input)
+        return regex.stringByReplacingMatches(in: input, range: range, withTemplate: " ")
     }
 }
 
