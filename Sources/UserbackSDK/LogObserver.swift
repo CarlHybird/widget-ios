@@ -2,13 +2,15 @@ import Foundation
 
 #if canImport(UIKit) && canImport(WebKit)
 
-@MainActor
 public final class LogObserver {
     public static let shared = LogObserver()
+    public static let ringCapacity = 300
 
     private var pipe: Pipe?
     private var originalStdout: Int32?
     private var originalStderr: Int32?
+    private let bufferQueue = DispatchQueue(label: "io.userback.log-observer")
+    private var ring: [String] = []
 
     private init() {}
 
@@ -27,11 +29,9 @@ public final class LogObserver {
 
         let mirroredStdoutFD = originalStdout
 
-        newPipe.fileHandleForReading.readabilityHandler = { handle in
+        newPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty else {
-                return
-            }
+            guard !data.isEmpty else { return }
 
             // Mirror captured output back to original stdout so Xcode console still shows logs.
             if let stdoutFD = mirroredStdoutFD {
@@ -49,54 +49,7 @@ public final class LogObserver {
                 }
             }
 
-            guard let raw = String(data: data, encoding: .utf8) else {
-                return
-            }
-
-            let messages = raw
-                .split(whereSeparator: \.isNewline)
-                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-
-            for message in messages {
-                // Avoid feedback loops from SDK/internal observer logs.
-                if message.hasPrefix("UserbackSDK:") ||
-                    message.hasPrefix("LogObserver") ||
-                    message == "================" {
-                    continue
-                }
-
-                // Ignore noisy Apple system logs that are not app-level diagnostics.
-                if message.hasPrefix("OSLOG-") ||
-                    message.localizedCaseInsensitiveContains("RemoteTextInput") ||
-                    message.localizedCaseInsensitiveContains("RTILog") ||
-                    message.localizedCaseInsensitiveContains("NSAutoresizingMaskLayoutConstraint") ||
-                    message.localizedCaseInsensitiveContains("NSLayoutConstraint") ||
-                    message.localizedCaseInsensitiveContains("Unable to simultaneously satisfy constraints") ||
-                    message.localizedCaseInsensitiveContains("UIViewAlertForUnsatisfiableConstraints") ||
-                    message.localizedCaseInsensitiveContains("Probably at least one of the constraints") ||
-                    message.localizedCaseInsensitiveContains("Will attempt to recover by breaking constraint") ||
-                    message.localizedCaseInsensitiveContains("UIConstraintBasedLayoutDebugging category on UIView") ||
-                    message.localizedCaseInsensitiveContains("_UIToolbarContentView") ||
-                    message.localizedCaseInsensitiveContains("_UIButtonBarStackView") {
-                    continue
-                }
-
-                // Trim whitespace and collapse multiple spaces
-                let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-                    .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-
-                guard !trimmed.isEmpty else { continue }
-
-                let event: [String: Any] = [
-                    "type": "log",
-                    "message": trimmed
-                ]
-
-                Task { @MainActor in
-                    UserbackSDK.shared.sendNativeEvent(event)
-                }
-            }
+            self?.ingest(data)
         }
 
         print("LogObserver started")
@@ -118,7 +71,76 @@ public final class LogObserver {
         }
 
         pipe = nil
+        clear()
         print("LogObserver stopped")
+    }
+
+    /// Returns buffered log lines and empties the ring. Safe to call from the main actor.
+    public func drainMessages() -> [String] {
+        bufferQueue.sync {
+            let copy = ring
+            ring.removeAll(keepingCapacity: true)
+            return copy
+        }
+    }
+
+    public func clear() {
+        bufferQueue.sync {
+            ring.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private func ingest(_ data: Data) {
+        guard let raw = String(data: data, encoding: .utf8) else { return }
+
+        let messages = raw
+            .split(whereSeparator: \.isNewline)
+            .compactMap { prepare(String($0)) }
+
+        guard !messages.isEmpty else { return }
+
+        bufferQueue.async {
+            for message in messages {
+                if self.ring.count >= Self.ringCapacity {
+                    self.ring.removeFirst(self.ring.count - Self.ringCapacity + 1)
+                }
+                self.ring.append(message)
+            }
+        }
+    }
+
+    private func prepare(_ message: String) -> String? {
+        // Avoid feedback loops from SDK/internal observer logs.
+        if message.hasPrefix("UserbackSDK:") ||
+            message.hasPrefix("LogObserver") ||
+            message == "================" {
+            return nil
+        }
+
+        // Ignore noisy Apple system logs that are not app-level diagnostics.
+        if message.hasPrefix("OSLOG-") ||
+            message.localizedCaseInsensitiveContains("RemoteTextInput") ||
+            message.localizedCaseInsensitiveContains("RTILog") ||
+            message.localizedCaseInsensitiveContains("NSAutoresizingMaskLayoutConstraint") ||
+            message.localizedCaseInsensitiveContains("NSLayoutConstraint") ||
+            message.localizedCaseInsensitiveContains("Unable to simultaneously satisfy constraints") ||
+            message.localizedCaseInsensitiveContains("UIViewAlertForUnsatisfiableConstraints") ||
+            message.localizedCaseInsensitiveContains("Probably at least one of the constraints") ||
+            message.localizedCaseInsensitiveContains("Will attempt to recover by breaking constraint") ||
+            message.localizedCaseInsensitiveContains("UIConstraintBasedLayoutDebugging category on UIView") ||
+            message.localizedCaseInsensitiveContains("_UIToolbarContentView") ||
+            message.localizedCaseInsensitiveContains("_UIButtonBarStackView") {
+            return nil
+        }
+
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+
+        guard !trimmed.isEmpty else { return nil }
+
+        let redacted = SecretRedactor.redact(trimmed)
+        guard !redacted.isEmpty else { return nil }
+        return redacted
     }
 }
 

@@ -65,8 +65,11 @@ public final class UserbackSDK: NSObject {
     }
 
     private let defaultWidgetJSURL = "https://static.userback.io/widget/v1.js"
-    private let flushInterval: TimeInterval = 1.0
-    private let bufferLimit = 50
+    private let flushInterval: TimeInterval = 2.0
+    private let bufferLimit = 300
+    private let widgetReadyPollInterval: TimeInterval = 0.1
+    private let widgetReadyMaxAttempts = 150
+    private let widgetLoadGraceAttempts = 50
 
     private var configuration: Configuration?
     private var state: State = .idle
@@ -84,6 +87,8 @@ public final class UserbackSDK: NSObject {
     private var isCapturingScreenshot = false
     private var shouldSendScreenshotWhenReady = false
     private var pendingVideoFileURL: URL?
+    private var isWidgetScriptReady = false
+    private var widgetReadyPollTask: DispatchWorkItem?
     private var isSendingNativeVideo = false
     private var patchedWidgetSource: String?
     private var didPatchWidgetJavaScript = false
@@ -210,6 +215,7 @@ public final class UserbackSDK: NSObject {
         hasLoadedWidgetPage = false
         didPatchWidgetJavaScript = false
         pendingVideoFileURL = nil
+        resetWidgetScriptReadiness()
         latestWidgetConfig = nil
         latestWidgetSize = nil
         stopNativeObserversIfNeeded()
@@ -407,7 +413,7 @@ public final class UserbackSDK: NSObject {
             eventBuffer.removeFirst(eventBuffer.count - bufferLimit + 1)
         }
         eventBuffer.append(event)
-        flushBufferedEvents()
+        // Batched by the flush timer / form-open path. Do not evaluateJavaScript per event.
     }
 
     public func isLoaded(completion: @escaping (Bool) -> Void) {
@@ -496,6 +502,10 @@ public final class UserbackSDK: NSObject {
         webView.transform = .identity
         webView.isUserInteractionEnabled = false
 
+        startFormOpenTimeout()
+    }
+
+    private func startFormOpenTimeout() {
         formOpenTimeoutTask?.cancel()
         let task = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -504,6 +514,57 @@ public final class UserbackSDK: NSObject {
         }
         formOpenTimeoutTask = task
         DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: task)
+    }
+
+    /// Gates log/network batches only. The widget registers its `userback:native*Event`
+    /// listeners as it boots, and `didFinish` fires before `v1.js` has run, so a batch
+    /// sent in that window is dispatched to nothing and those lines are lost. The
+    /// widget's `load` message is the real signal; this polling is a fallback for
+    /// widget builds that never post one.
+    private func beginWidgetReadyPolling(attempt: Int = 0) {
+        guard !isWidgetScriptReady, webView != nil else { return }
+
+        if attempt == 0 {
+            widgetReadyPollTask?.cancel()
+            widgetReadyPollTask = nil
+        }
+
+        evaluateJavaScript("!!(window.Userback && typeof window.Userback.openForm === 'function')") { [weak self] result, _ in
+            guard let self else { return }
+            guard !self.isWidgetScriptReady else { return }
+
+            if result as? Bool == true, attempt >= self.widgetLoadGraceAttempts {
+                self.log("Widget did not post 'load'; proceeding on openForm availability.")
+                self.markWidgetScriptReady()
+                return
+            }
+
+            guard attempt < self.widgetReadyMaxAttempts else {
+                self.log("Widget JS never became ready.")
+                return
+            }
+
+            let task = DispatchWorkItem { [weak self] in
+                self?.beginWidgetReadyPolling(attempt: attempt + 1)
+            }
+            self.widgetReadyPollTask = task
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.widgetReadyPollInterval, execute: task)
+        }
+    }
+
+    private func markWidgetScriptReady() {
+        guard !isWidgetScriptReady else { return }
+        isWidgetScriptReady = true
+        widgetReadyPollTask?.cancel()
+        widgetReadyPollTask = nil
+
+        flushBufferedEvents()
+    }
+
+    private func resetWidgetScriptReadiness() {
+        isWidgetScriptReady = false
+        widgetReadyPollTask?.cancel()
+        widgetReadyPollTask = nil
     }
 
     public func openPortal() {
@@ -879,6 +940,7 @@ public final class UserbackSDK: NSObject {
 
         hasLoadedWidgetPage = false
         didPatchWidgetJavaScript = false
+        resetWidgetScriptReadiness()
 
         if !attachToWindow(webView) {
             scheduleWindowAttachRetry()
@@ -1027,46 +1089,98 @@ public final class UserbackSDK: NSObject {
         guard flushTimer == nil else { return }
 
         flushTimer = Timer.scheduledTimer(withTimeInterval: flushInterval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.flushBufferedEvents()
+            Task { @MainActor [weak self] in
+                self?.flushBufferedEvents()
+            }
         }
     }
 
     private func flushBufferedEvents() {
-        guard state == .ready else { return }
+        // The widget registers the `userback:native*Event` listeners as it boots, so
+        // anything dispatched before that would be dropped.
+        guard state == .ready, isWidgetScriptReady else { return }
+
+        let logMessages = LogObserver.shared.drainMessages()
+        if !logMessages.isEmpty {
+            sendNativeLogBatchToJavaScript(logMessages)
+        }
+
         guard !eventBuffer.isEmpty else { return }
 
         let pending = eventBuffer
-        eventBuffer.removeAll()
+        eventBuffer.removeAll(keepingCapacity: true)
+        sendNativeEventBatchToJavaScript(pending)
+    }
 
-        for event in pending {
-            sendNativeEventToJavaScript(event)
+    private func sendNativeLogBatchToJavaScript(_ messages: [String]) {
+        let items: [[String: Any]] = messages.map { message in
+            [
+                "type": "native_event",
+                "mobileSDK": true,
+                "payload": [
+                    "type": "log",
+                    "message": message,
+                    "mobileSDK": true
+                ]
+            ]
+        }
+        sendNativeMessageBatchToJavaScript(items, eventName: "userback:nativeLogEvent", successLogPrefix: "Native log batch")
+    }
+
+    private func sendNativeEventBatchToJavaScript(_ events: [[String: Any]]) {
+        var logs: [[String: Any]] = []
+        var networks: [[String: Any]] = []
+
+        for event in events {
+            var payload = event
+            payload["mobileSDK"] = true
+            let message: [String: Any] = [
+                "type": "native_event",
+                "mobileSDK": true,
+                "payload": payload
+            ]
+            if (event["eventType"] as? String)?.lowercased() == "network" {
+                networks.append(message)
+            } else {
+                logs.append(message)
+            }
+        }
+
+        if !logs.isEmpty {
+            sendNativeMessageBatchToJavaScript(logs, eventName: "userback:nativeLogEvent", successLogPrefix: "Native event batch")
+        }
+        if !networks.isEmpty {
+            sendNativeMessageBatchToJavaScript(networks, eventName: "userback:nativeNetworkEvent", successLogPrefix: "Native network batch")
         }
     }
 
-    private func sendNativeEventToJavaScript(_ event: [String: Any]) {
-        let message: [String: Any] = [
-            "type": "native_event",
-            "payload": event
-        ]
+    private func sendNativeMessageBatchToJavaScript(
+        _ messages: [[String: Any]],
+        eventName: String,
+        successLogPrefix: String
+    ) {
+        guard let messagesJSON = jsonString(from: messages) else {
+            log("\(successLogPrefix) payload serialization failed for JS delivery.")
+            return
+        }
 
-        let customEventName = nativeEventName(for: event)
+        let eventNameLiteral = jsQuotedString(eventName)
+        let script = """
+        (function() {
+            var messages = \(messagesJSON);
+            var eventName = \(eventNameLiteral);
+            for (var i = 0; i < messages.length; i++) {
+                try {
+                    window.dispatchEvent(new CustomEvent(eventName, { detail: messages[i] }));
+                } catch (error) {}
+            }
+            return messages.length;
+        })();
+        """
 
-        sendMessageToJavaScript(
-            message,
-            customEventName: customEventName,
-            successLogPrefix: "Native event"
-        )
-    }
-
-    private func nativeEventName(for event: [String: Any]) -> String {
-        let eventType = (event["eventType"] as? String)?.lowercased()
-
-        switch eventType {
-            case "network":
-                return "userback:nativeNetworkEvent"
-            default:
-                return "userback:nativeLogEvent"
+        evaluateJavaScript(script) { [weak self] result, _ in
+            let count = (result as? Int) ?? (result as? Double).map(Int.init) ?? messages.count
+            self?.log("\(successLogPrefix) delivered \(count) event(s) to JS.")
         }
     }
 
@@ -1314,7 +1428,7 @@ public final class UserbackSDK: NSObject {
 extension UserbackSDK: WKNavigationDelegate {
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         state = .ready
-        flushBufferedEvents()
+        beginWidgetReadyPolling()
     }
 }
 
@@ -1348,6 +1462,7 @@ extension UserbackSDK: WKScriptMessageHandler {
                 log("Widget config loaded: \(feedbackConfig)")
                 applyLatestWidgetSizeToWebViewIfNeeded()
                 onWidgetConfigLoaded?(feedbackConfig)
+                markWidgetScriptReady()
             case "widget_resize":
                 handleWidgetResize(body)
             case "widget_action":

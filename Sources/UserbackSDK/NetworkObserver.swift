@@ -110,7 +110,7 @@ private final class UserbackNetworkURLProtocol: URLProtocol {
 
         let event: [String: Any] = [
             "eventType": "network",
-            "name": task.originalRequest?.url?.absoluteString ?? "",
+            "name": SecretRedactor.redact(task.originalRequest?.url?.absoluteString ?? ""),
             "type": initiatorType(for: task.originalRequest),
             "method": task.originalRequest?.httpMethod ?? "GET",
             "status": response?.statusCode ?? 0,
