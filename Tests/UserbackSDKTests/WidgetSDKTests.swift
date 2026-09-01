@@ -1,9 +1,43 @@
 import XCTest
 @testable import UserbackSDK
 
+@MainActor
 final class UserbackSDKTests: XCTestCase {
     func testVersion() {
         XCTAssertEqual(UserbackSDK.version(), "1.0.0")
+    }
+
+    func testBootstrapCarriesIdentityAndWidgetSettings() {
+        UserbackSDK.shared.configure(
+            accessToken: "M-token",
+            widgetJSURL: "https://static.userback.io/widget/v1.js",
+            userData: ["id": "42", "info": ["email": "jane@example.com"]],
+            widgetSettings: ["form_settings": ["bug": ["email_field": false]]]
+        )
+
+        let bootstrap = UserbackSDK.shared.buildInjectedJS()
+
+        XCTAssertTrue(bootstrap.contains("Userback.user_data = "))
+        XCTAssertTrue(bootstrap.contains("jane@example.com"))
+        XCTAssertTrue(bootstrap.contains("Userback.widget_settings = "))
+        XCTAssertTrue(bootstrap.contains("\"email_field\":false"))
+    }
+
+    /// The widget warns about a missing user ID rather than ignoring an identity it cannot use,
+    /// and an empty `widget_settings` would take the form settings override path for nothing.
+    func testBootstrapOmitsUnusableIdentityAndEmptySettings() {
+        UserbackSDK.shared.configure(
+            accessToken: "M-token",
+            widgetJSURL: "https://static.userback.io/widget/v1.js",
+            userData: [:],
+            widgetSettings: [:]
+        )
+
+        let bootstrap = UserbackSDK.shared.buildInjectedJS()
+
+        XCTAssertFalse(bootstrap.contains("user_data"))
+        XCTAssertFalse(bootstrap.contains("widget_settings"))
+        XCTAssertTrue(bootstrap.contains("Userback.access_token = \"M-token\""))
     }
 
     func testNativeVideoListenerIsSplicedBesideScreenshotHook() {

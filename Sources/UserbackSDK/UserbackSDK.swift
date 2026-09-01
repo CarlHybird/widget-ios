@@ -27,6 +27,7 @@ public final class UserbackSDK: NSObject {
         public let accessToken: String
         public let widgetJSURL: String
         public let userData: [String: Any]
+        public let widgetSettings: [String: Any]
         public let widgetCSS: String?
         public let surveyURL: String?
         public let requestURL: String?
@@ -36,6 +37,7 @@ public final class UserbackSDK: NSObject {
             accessToken: String,
             widgetJSURL: String,
             userData: [String: Any] = [:],
+            widgetSettings: [String: Any] = [:],
             widgetCSS: String? = nil,
             surveyURL: String? = nil,
             requestURL: String? = nil,
@@ -44,6 +46,7 @@ public final class UserbackSDK: NSObject {
             self.accessToken = accessToken
             self.widgetJSURL = widgetJSURL
             self.userData = userData
+            self.widgetSettings = widgetSettings
             self.widgetCSS = widgetCSS
             self.surveyURL = surveyURL
             self.requestURL = requestURL
@@ -138,6 +141,7 @@ public final class UserbackSDK: NSObject {
         accessToken: String,
         widgetJSURL: String,
         userData: [String: Any]? = nil,
+        widgetSettings: [String: Any]? = nil,
         widgetCSS: String? = nil,
         surveyURL: String? = nil,
         requestURL: String? = nil,
@@ -147,6 +151,7 @@ public final class UserbackSDK: NSObject {
             accessToken: accessToken,
             widgetJSURL: widgetJSURL,
             userData: userData ?? [:],
+            widgetSettings: widgetSettings ?? [:],
             widgetCSS: widgetCSS,
             surveyURL: surveyURL,
             requestURL: requestURL,
@@ -157,6 +162,7 @@ public final class UserbackSDK: NSObject {
     public func start(
         accessToken: String,
         userData: [String: Any] = [:],
+        widgetSettings: [String: Any] = [:],
         widgetCSS: String? = nil,
         surveyURL: String? = nil,
         requestURL: String? = nil,
@@ -167,6 +173,7 @@ public final class UserbackSDK: NSObject {
             accessToken: accessToken,
             widgetJSURL: widgetJSURL ?? defaultWidgetJSURL,
             userData: userData,
+            widgetSettings: widgetSettings,
             widgetCSS: widgetCSS,
             surveyURL: surveyURL,
             requestURL: requestURL,
@@ -1194,7 +1201,7 @@ public final class UserbackSDK: NSObject {
         ]
     }
 
-    private func buildInjectedJS() -> String {
+    func buildInjectedJS() -> String {
         let device = UIDevice.current
         let bundle = Bundle.main
         let appVersion = bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
@@ -1218,6 +1225,19 @@ public final class UserbackSDK: NSObject {
             "dpi_scale": scale
         ]
 
+        // `v1.js` reads both of these as it boots: `user_data` identifies the user and
+        // `widget_settings` overrides the form settings that come back from the project's
+        // dashboard config. Injecting them beats calling `identify` afterwards, which is
+        // dropped while the JS API does not exist yet. An empty `user_data` is left out
+        // entirely, as the widget warns about the missing user ID rather than ignoring it.
+        var hostOverrides = ""
+        if let userData = configuration?.userData, userData["id"] != nil, userData["info"] != nil {
+            hostOverrides += "Userback.user_data = \(jsonLiteral(userData));\n"
+        }
+        if let widgetSettings = configuration?.widgetSettings, !widgetSettings.isEmpty {
+            hostOverrides += "Userback.widget_settings = \(jsonLiteral(widgetSettings));\n"
+        }
+
         var devOverrides = ""
         if let widgetCSS = configuration?.widgetCSS { devOverrides += "Userback.widget_css = \(jsonLiteral(widgetCSS));\n" }
         if let surveyURL = configuration?.surveyURL { devOverrides += "Userback.survey_url = \(jsonLiteral(surveyURL));\n" }
@@ -1228,7 +1248,7 @@ public final class UserbackSDK: NSObject {
         window.Userback = window.Userback || {};
         Userback.load_type = "mobile_sdk";
         Userback.access_token = \(jsonLiteral(configuration?.accessToken));
-        Userback.user_data = \(jsonLiteral(configuration?.userData));
+        \(hostOverrides)
         \(devOverrides)
         Userback.native_env = \(jsonLiteral(nativeEnv));
         Userback.native_ua_data = \(jsonLiteral(nativeUAData()));
