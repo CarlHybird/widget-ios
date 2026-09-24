@@ -88,6 +88,7 @@ public final class UserbackSDK: NSObject {
     private var formOpenTimeoutTask: DispatchWorkItem?
     private var pendingScreenshotDataURL: String?
     private var isCapturingScreenshot = false
+    private var screenshotCaptureGeneration = 0
     private var shouldSendScreenshotWhenReady = false
     private var pendingVideoFileURL: URL?
     private var isWidgetScriptReady = false
@@ -222,6 +223,7 @@ public final class UserbackSDK: NSObject {
         hasLoadedWidgetPage = false
         didPatchWidgetJavaScript = false
         pendingVideoFileURL = nil
+        discardPreparedScreenshot()
         resetWidgetScriptReadiness()
         latestWidgetConfig = nil
         latestWidgetSize = nil
@@ -270,6 +272,31 @@ public final class UserbackSDK: NSObject {
     /// Call before `openForm`. Screenshot capture is skipped when a video is pending.
     public func attachNativeVideo(fileURL: URL) {
         pendingVideoFileURL = fileURL
+    }
+
+    /// Captures and holds a screenshot for the next screenshot form.
+    ///
+    /// Hosts can call this before presenting their own feedback UI so that UI is not
+    /// included in the attachment. A failed capture is reported through `completion`;
+    /// `openForm` will fall back to capturing at open time.
+    public func prepareScreenshot(completion: @escaping (Bool) -> Void) {
+        beginScreenshotCapture {
+            completion(self.pendingScreenshotDataURL != nil)
+        }
+    }
+
+    /// Removes a screenshot prepared by `prepareScreenshot`.
+    ///
+    /// Call this when the host dismisses its feedback UI or chooses a video instead.
+    public func discardPreparedScreenshot() {
+        screenshotCaptureGeneration += 1
+        pendingScreenshotDataURL = nil
+        isCapturingScreenshot = false
+        shouldSendScreenshotWhenReady = false
+    }
+
+    var hasPreparedScreenshot: Bool {
+        pendingScreenshotDataURL != nil
     }
 
     private func startNativeObserversIfNeeded() {
@@ -455,7 +482,7 @@ public final class UserbackSDK: NSObject {
         // `drawHierarchy` (slow, and it waits for screen updates) lands on the same
         // frames as the widget's opening animation, which makes the form appear and
         // then get torn down. Later opens are fast enough that the race usually misses.
-        if directTo?.lowercased() == "screenshot" && !isWidgetOpen {
+        if shouldBeginScreenshotCapture(directTo: directTo) {
             beginScreenshotCapture { [weak self] in
                 self?.performOpenForm(mode: mode, directTo: directTo, projectKey: projectKey)
             }
@@ -463,6 +490,12 @@ public final class UserbackSDK: NSObject {
         }
 
         performOpenForm(mode: mode, directTo: directTo, projectKey: projectKey)
+    }
+
+    func shouldBeginScreenshotCapture(directTo: String?) -> Bool {
+        directTo?.lowercased() == "screenshot"
+            && !isWidgetOpen
+            && !hasPreparedScreenshot
     }
 
     private func performOpenForm(mode: String, directTo: String?, projectKey: String) {
@@ -1826,6 +1859,8 @@ extension UserbackSDK: WKScriptMessageHandler {
     /// Starts a capture ahead of the widget opening. The widget is opened only after this
     /// completes, so the slow first snapshot cannot race with the form's opening animation.
     private func beginScreenshotCapture(completion: @escaping () -> Void) {
+        screenshotCaptureGeneration += 1
+        let captureGeneration = screenshotCaptureGeneration
         pendingScreenshotDataURL = nil
         isCapturingScreenshot = true
         shouldSendScreenshotWhenReady = false
@@ -1836,6 +1871,10 @@ extension UserbackSDK: WKScriptMessageHandler {
 
         captureScreenshotDataURL { [weak self] dataURL in
             guard let self else { return }
+            guard self.screenshotCaptureGeneration == captureGeneration else {
+                completion()
+                return
+            }
             self.isCapturingScreenshot = false
             self.pendingScreenshotDataURL = dataURL
             completion()
