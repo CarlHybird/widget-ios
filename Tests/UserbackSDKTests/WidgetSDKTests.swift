@@ -1,10 +1,61 @@
 import XCTest
+import UIKit
 @testable import UserbackSDK
 
 @MainActor
 final class UserbackSDKTests: XCTestCase {
     func testVersion() {
         XCTAssertEqual(UserbackSDK.version(), "1.0.0")
+    }
+
+    func testPrepareScreenshotStoresImageForNextScreenshotForm() {
+        resetScreenshotState()
+        defer { resetScreenshotState() }
+
+        var captureCount = 0
+        UserbackSDK.shared.screenshotProvider = { completion in
+            captureCount += 1
+            completion(Self.testImage())
+        }
+
+        var didPrepare = false
+        UserbackSDK.shared.prepareScreenshot { didPrepare = $0 }
+
+        XCTAssertTrue(didPrepare)
+        XCTAssertTrue(UserbackSDK.shared.hasPreparedScreenshot)
+        XCTAssertEqual(captureCount, 1)
+        XCTAssertFalse(UserbackSDK.shared.shouldBeginScreenshotCapture(directTo: "screenshot"))
+    }
+
+    func testDiscardPreparedScreenshotRestoresOpenTimeCaptureFallback() {
+        resetScreenshotState()
+        defer { resetScreenshotState() }
+
+        UserbackSDK.shared.screenshotProvider = { completion in
+            completion(Self.testImage())
+        }
+        UserbackSDK.shared.prepareScreenshot { _ in }
+
+        UserbackSDK.shared.discardPreparedScreenshot()
+
+        XCTAssertFalse(UserbackSDK.shared.hasPreparedScreenshot)
+        XCTAssertTrue(UserbackSDK.shared.shouldBeginScreenshotCapture(directTo: "screenshot"))
+    }
+
+    func testDiscardDuringCapturePreventsLateImageBecomingPrepared() {
+        resetScreenshotState()
+        defer { resetScreenshotState() }
+
+        var providerCompletion: ((UIImage?) -> Void)?
+        var prepareResult: Bool?
+        UserbackSDK.shared.screenshotProvider = { providerCompletion = $0 }
+
+        UserbackSDK.shared.prepareScreenshot { prepareResult = $0 }
+        UserbackSDK.shared.discardPreparedScreenshot()
+        providerCompletion?(Self.testImage())
+
+        XCTAssertEqual(prepareResult, false)
+        XCTAssertFalse(UserbackSDK.shared.hasPreparedScreenshot)
     }
 
     func testBootstrapCarriesIdentityAndWidgetSettings() {
@@ -104,5 +155,17 @@ final class UserbackSDKTests: XCTestCase {
         XCTAssertFalse(redacted.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"))
         XCTAssertTrue(redacted.contains("[redacted]"))
         XCTAssertTrue(redacted.contains("done"))
+    }
+
+    private static func testImage() -> UIImage {
+        UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).image { context in
+            UIColor.red.setFill()
+            context.cgContext.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        }
+    }
+
+    private func resetScreenshotState() {
+        UserbackSDK.shared.screenshotProvider = nil
+        UserbackSDK.shared.stop()
     }
 }
