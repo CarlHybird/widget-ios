@@ -134,7 +134,9 @@ public final class UserbackSDK: NSObject {
     /// built-in snapshot.
     public var screenshotProvider: ((@escaping (UIImage?) -> Void) -> Void)?
 
-    private override init() {
+    // Internal so presentation tests can use an instance independent of app startup.
+    // Host applications continue to use `shared`.
+    override init() {
         super.init()
     }
 
@@ -783,7 +785,10 @@ public final class UserbackSDK: NSObject {
         guard let window = activeWindow() else {
             return false
         }
-        let containerView = presentationContainerView(for: window)
+        // Use a sibling overlay above UIKit/SwiftUI presentation containers. Adding
+        // subviews to UIHostingController.view is unsupported, and a host controller's
+        // content can also sit underneath an already-presented sheet.
+        let containerView: UIView = window
 
         let configuredURLString = configuration?.widgetJSURL ?? defaultWidgetJSURL
         if !hasLoadedWidgetPage {
@@ -805,47 +810,6 @@ public final class UserbackSDK: NSObject {
         pendingWindowAttachment = false
         removeActivationObservers()
         return true
-    }
-
-    private func presentationContainerView(for window: UIWindow) -> UIView {
-        if let presentingViewController = presentingViewController(for: window) {
-            return presentingViewController.view
-        }
-        return window
-    }
-
-    private func presentingViewController(for window: UIWindow) -> UIViewController? {
-        if let root = window.rootViewController {
-            return topMostViewController(from: root)
-        }
-        return nil
-    }
-
-    private func topMostViewController(from root: UIViewController) -> UIViewController {
-        var current = root
-
-        while true {
-            if let presented = current.presentedViewController {
-                current = presented
-                continue
-            }
-
-            if let nav = current as? UINavigationController,
-               let visible = nav.visibleViewController {
-                current = visible
-                continue
-            }
-
-            if let tab = current as? UITabBarController,
-               let selected = tab.selectedViewController {
-                current = selected
-                continue
-            }
-
-            break
-        }
-
-        return current
     }
 
     private func pinWebViewToContainer(_ webView: WKWebView, containerView: UIView) {
